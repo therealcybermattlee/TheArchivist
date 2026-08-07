@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Project
+# real Apple IDs / local paths live here — see config.example.yaml
+config.yaml
+samples/
+*.sqlite3
+# run journals
+*.jsonl
+
+# Tooling
+.pytest_cache/
+.claude/settings.local.json
+
+# OS noise
+.DS_Store

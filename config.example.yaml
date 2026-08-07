@@ -1,0 +1,28 @@
+# The Archivist — configuration
+# Copy to config.yaml and adjust. The tool looks for ./config.yaml by default
+# (override with --config / ARCHIVIST_CONFIG).
+
+archive_root: "/Volumes/VideoStorage"      # primary TrueNAS share; the ONLY write target.
+                                           # Replication to the 2nd TrueNAS is user-owned (NFS) and out of scope.
+                                           #   Linux host: "/mnt/archive" (NFS mount — see docs/linux-host.md)
+work_root: "/Volumes/ExternalBaseUnit"     # local external drive MOUNT (sentinel/guard live at this root)
+                                           #   Linux host: "/srv/archivist-work" (~50 GB transient working disk)
+work_subdir: "TheArchivist"                # all working files live under work_root/work_subdir/
+                                           #   -> /Volumes/ExternalBaseUnit/TheArchivist/{staging,drops,logs,catalog,exports}
+                                           #   exports/ holds generated map .kmz files (export-map)
+
+default_timezone: "America/Detroit"        # US Eastern; UTC timestamps normalized to this for folder dates
+
+# Source -> Level-3 device folder name. Every ingest pathway maps to one.
+sources:
+  matt-personal:   { type: icloud,  device_folder: "Matt Personal Cell", username: "you@icloud.com" }
+  matt-public:     { type: icloud,  device_folder: "Matt Public Cell",   username: "you2@icloud.com" }
+  matt-takeout:    { type: takeout, device_folder: "Matt Public Cell" }
+  gopro3:          { type: device,  device_folder: "GoPro3" }
+  insta-go3:       { type: device,  device_folder: "Insta Go3" }
+  peepaw-cell:     { type: drop,    device_folder: "Peepaw Cell" }
+  peepaw-old-pics: { type: drop,    device_folder: "Peepaw Old Pictures" }
+  kat-cell:        { type: drop,    device_folder: "Kat Cell" }
+  john-cell:       { type: drop,    device_folder: "John Cell" }
+  andrew-cell:     { type: drop,    device_folder: "Andrew Cell" }
+  misc:            { type: drop,    device_folder: "Misc" }
