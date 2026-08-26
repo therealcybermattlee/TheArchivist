@@ -49,11 +49,16 @@ checklist. Highlights:
 
 ```bash
 uv run archivist doctor           # environment health check for THIS host
-uv run archivist pull icloud --source X --apply
-                                  # routine: windowed pull since last success (−7d overlap)
+uv run archivist pull all --apply # routine refresh: every iCloud source, each
+                                  # windowed since its own last success (−7d overlap)
+uv run archivist pull icloud --source X --apply    # or one source at a time
 uv run archivist prune-staging    # plan: reclaim staged files whose VERIFIED
 uv run archivist prune-staging --apply   # archived copy exists (journaled)
 ```
+
+`pull all` keeps going when one account fails (expired session, ingest error);
+that source simply doesn't advance its state, so the next run re-covers the
+same window. The closing summary names anything to re-run.
 
 Working storage is a small transient pass-through (~50 GB budget — shown in
 `status`); media's permanent home is always the TrueNAS archive. Only one
@@ -68,5 +73,6 @@ Integration fixtures generate tiny real media with genuine GPS/date metadata
 
 ## Status
 Delivered: `status`, `init-volumes`, `scan-archive`, `ingest`, `ingest-drops`,
-`cleanup`, `purge`, `auth icloud` / `pull icloud`, `scan-locations`,
-`export-map`. See `specs/` for feature specs (001 baseline, 002 geolocation).
+`cleanup`, `purge`, `auth icloud` / `pull icloud` / `pull all`,
+`scan-locations`, `export-map`, `prune-staging`, `doctor`. See `specs/` for
+feature specs (001 baseline, 002 geolocation, 003 Immich viewer, 004 Linux host).

@@ -6,6 +6,7 @@ stubs that announce their target phase so the surface is visible end-to-end.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -747,6 +748,97 @@ def auth_icloud(
         raise typer.Exit(code=rc)
 
 
+@dataclass
+class PullOutcome:
+    """Per-source result, so `pull all` can report without re-deriving it."""
+    source: str
+    status: str                    # ok | no-state | config-invalid
+                                   #    | download-failed | ingest-failed
+    detail: str = ""
+    copied: int = 0
+    copied_bytes: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
+def _pull_one(cfg: Config, source: str, *, recent=None, since=None, until=None,
+              until_found=None, full=False, no_download=False, apply=False,
+              show=12) -> PullOutcome:
+    """Pull + ingest ONE iCloud source. Returns an outcome instead of exiting,
+    so a multi-source run can carry on past a failure. Window/state semantics
+    are unchanged: state advances only for an applying, present-reaching,
+    failure-free run.
+    """
+    from datetime import datetime as _dt
+    from . import icloud
+
+    src = _icloud_source(cfg, source)
+    cat = Catalog(cfg.catalog_db)
+    state_key = icloud.pull_state_key(source)
+    explicit_window = (recent is not None or since is not None or until is not None
+                       or until_found is not None or full)
+
+    if not explicit_window and not no_download:
+        with cat.connect() as conn:
+            last_pull = cat.get_meta(conn, state_key) if cat.exists() else None
+        if last_pull is None:
+            typer.secho(
+                f"No pull state for '{source}' on this host — refusing a stateless "
+                "full-library pull.\nUse an explicit window: --recent N, "
+                "--since YYYY-MM-DD, or --full for a deliberate bootstrap.",
+                fg=typer.colors.RED, err=True,
+            )
+            return PullOutcome(source, "no-state",
+                               "needs an explicit --full/--since bootstrap")
+        since = icloud.window_since(last_pull)
+        typer.echo(f"Windowed pull: items created since {since} "
+                   f"(last successful pull {last_pull[:19]}, −{icloud.WINDOW_OVERLAP_DAYS}d overlap)")
+
+    mirror = cfg.icloud_dir / source
+    if not no_download:
+        typer.echo(f"Downloading iCloud ({src.username}) -> {mirror}")
+        if full:
+            typer.secho("  (--full: entire library — bootstrap-scale download)", fg=typer.colors.YELLOW)
+        try:
+            rc = icloud.download(src.username, mirror, cfg.icloud_session_dir,
+                                 recent=recent, until_found=until_found,
+                                 since=since, until=until)
+        except icloud.ICloudError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            return PullOutcome(source, "download-failed", str(exc))
+        if rc != 0:
+            typer.secho(
+                f"icloudpd exited {rc}. If the session expired, run "
+                f"`archivist auth icloud --source {source}` and retry.",
+                fg=typer.colors.RED, err=True,
+            )
+            return PullOutcome(source, "download-failed", f"icloudpd exited {rc}")
+
+    # Hand the mirror to the Phase 2 ingest engine.
+    res = _run_ingest(cfg, mirror, src.device_folder, source, apply, show)
+
+    out = PullOutcome(source, "ok")
+    if res is not None:
+        out.copied, out.copied_bytes = res.copied, res.copied_bytes
+        out.skipped, out.failed = res.skipped, len(res.failed)
+
+    # Advance pull state only after a fully successful applying run
+    # (download OK, zero ingest failures) that reaches the PRESENT —
+    # historical range slices (--until) never advance the window.
+    if apply and not no_download and until is None and not (res is not None and res.failed):
+        with cat.connect() as conn:
+            cat.set_meta(conn, state_key,
+                         _dt.now().replace(microsecond=0).isoformat())
+            conn.commit()
+        typer.echo(f"  pull state advanced for '{source}'")
+    elif apply and res is not None and res.failed:
+        typer.secho("  pull state NOT advanced (ingest failures above) — "
+                    "the window will retry these items next run.", fg=typer.colors.YELLOW)
+        out.status = "ingest-failed"
+        out.detail = f"{len(res.failed)} file(s) failed to copy"
+    return out
+
+
 @pull_app.command("icloud")
 def pull_icloud(
     source: str = typer.Option(..., "--source", "-s", help="iCloud source key from config."),
@@ -766,69 +858,85 @@ def pull_icloud(
     pull minus a 7-day overlap, tracked per source in the catalog. Without
     stored state, an explicit --recent/--since/--full is required.
     """
-    from datetime import datetime as _dt
-    from . import icloud
     cfg = _load(config)
-    src = _icloud_source(cfg, source)
+    _icloud_source(cfg, source)   # validate before touching the mounts
     _require(cfg)  # need both mounts: work drive (mirror) + archive (ingest)
+    out = _pull_one(cfg, source, recent=recent, since=since, until=until,
+                    until_found=until_found, full=full, no_download=no_download,
+                    apply=apply, show=show)
+    if out.status != "ok":
+        raise typer.Exit(code=2)
 
-    cat = Catalog(cfg.catalog_db)
-    state_key = icloud.pull_state_key(source)
-    explicit_window = (recent is not None or since is not None or until is not None
-                       or until_found is not None or full)
 
-    windowed = False
-    if not explicit_window and not no_download:
-        with cat.connect() as conn:
-            last_pull = cat.get_meta(conn, state_key) if cat.exists() else None
-        if last_pull is None:
-            typer.secho(
-                f"No pull state for '{source}' on this host — refusing a stateless "
-                "full-library pull.\nUse an explicit window: --recent N, "
-                "--since YYYY-MM-DD, or --full for a deliberate bootstrap.",
-                fg=typer.colors.RED, err=True,
-            )
-            raise typer.Exit(code=2)
-        since = icloud.window_since(last_pull)
-        windowed = True
-        typer.echo(f"Windowed pull: items created since {since} "
-                   f"(last successful pull {last_pull[:19]}, −{icloud.WINDOW_OVERLAP_DAYS}d overlap)")
+@pull_app.command("all")
+def pull_all(
+    apply: bool = typer.Option(False, "--apply", help="Write to the archive (default: download + dry-run ingest)."),
+    show: int = typer.Option(6, "--show", help="Sample rows to print per source."),
+    stop_on_error: bool = typer.Option(False, "--stop-on-error", help="Abort at the first failing source (default: continue)."),
+    config: Optional[str] = ConfigOpt,
+) -> None:
+    """Routine refresh: windowed pull + ingest for EVERY iCloud source.
 
-    mirror = cfg.icloud_dir / source
-    if not no_download:
-        typer.echo(f"Downloading iCloud ({src.username}) -> {mirror}")
-        if full:
-            typer.secho("  (--full: entire library — bootstrap-scale download)", fg=typer.colors.YELLOW)
+    Each source pulls items created since its own last successful pull (minus
+    the 7-day overlap). A source that fails — expired session, ingest error —
+    does not advance its state and does not stop the others; the summary at
+    the end says what to re-run. Sources never bootstrapped are reported, not
+    guessed at: run an explicit --full for those first.
+    """
+    cfg = _load(config)
+    icloud_sources = [k for k, s in cfg.sources.items() if s.type == "icloud"]
+    if not icloud_sources:
+        typer.secho("No 'icloud' sources configured.", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=0)
+    _require(cfg)
+
+    # Name the config: discovery falls back to ~/.config/archivist/config.yaml
+    # when cwd has none, and a stale one there silently changes WHICH accounts
+    # (and which device folders) a run touches. Never leave that implicit.
+    typer.echo(f"config: {cfg.path}")
+    typer.secho(f"Refreshing {len(icloud_sources)} iCloud source(s): "
+                f"{', '.join(icloud_sources)}", bold=True)
+    if not apply:
+        typer.secho("Dry-run: downloads still happen, archive writes do NOT "
+                    "(re-run with --apply).", fg=typer.colors.YELLOW)
+
+    outcomes: list[PullOutcome] = []
+    for i, key in enumerate(icloud_sources, 1):
+        typer.secho(f"\n=== [{i}/{len(icloud_sources)}] {key} ===",
+                    fg=typer.colors.CYAN, bold=True)
         try:
-            rc = icloud.download(src.username, mirror, cfg.icloud_session_dir,
-                                 recent=recent, until_found=until_found,
-                                 since=since, until=until)
-        except icloud.ICloudError as exc:
-            typer.secho(str(exc), fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=2)
-        if rc != 0:
-            typer.secho(
-                f"icloudpd exited {rc}. If the session expired, run "
-                f"`archivist auth icloud --source {source}` and retry.",
-                fg=typer.colors.RED, err=True,
-            )
-            raise typer.Exit(code=rc)
+            out = _pull_one(cfg, key, apply=apply, show=show)
+        except typer.Exit:                      # config-level rejection
+            out = PullOutcome(key, "config-invalid",
+                              "see the error above — fix config.yaml, not the account")
+        except Exception as exc:                # never let one source sink the run
+            typer.secho(f"  unexpected error: {exc}", fg=typer.colors.RED, err=True)
+            out = PullOutcome(key, "download-failed", str(exc))
+        outcomes.append(out)
+        if out.status != "ok" and stop_on_error:
+            typer.secho("Stopping (--stop-on-error).", fg=typer.colors.RED, err=True)
+            break
 
-    # Hand the mirror to the Phase 2 ingest engine.
-    res = _run_ingest(cfg, mirror, src.device_folder, source, apply, show)
-
-    # Advance pull state only after a fully successful applying run
-    # (download OK, zero ingest failures) that reaches the PRESENT —
-    # historical range slices (--until) never advance the window.
-    if apply and not no_download and until is None and not (res is not None and res.failed):
-        with cat.connect() as conn:
-            cat.set_meta(conn, state_key,
-                         _dt.now().replace(microsecond=0).isoformat())
-            conn.commit()
-        typer.echo(f"  pull state advanced for '{source}'")
-    elif apply and res is not None and res.failed:
-        typer.secho("  pull state NOT advanced (ingest failures above) — "
-                    "the window will retry these items next run.", fg=typer.colors.YELLOW)
+    typer.secho("\nRefresh summary", bold=True)
+    for o in outcomes:
+        if o.status == "ok":
+            typer.secho(f"  OK    {o.source:<16} copied {o.copied} "
+                        f"({_gb(o.copied_bytes)}), skipped {o.skipped}",
+                        fg=typer.colors.GREEN)
+        else:
+            typer.secho(f"  FAIL  {o.source:<16} {o.status}: {o.detail}",
+                        fg=typer.colors.RED)
+    bad = [o for o in outcomes if o.status != "ok"]
+    missing = [o.source for o in outcomes if o.status == "no-state"]
+    if missing:
+        typer.echo("\nBootstrap the never-pulled source(s) first, e.g.:")
+        for m in missing:
+            typer.echo(f"  archivist pull icloud --source {m} --full --apply")
+    if apply and not bad:
+        typer.echo("\nStaged copies can be reclaimed with: archivist prune-staging "
+                   "(then --apply).")
+    if bad:
+        raise typer.Exit(code=1)
 
 
 def main() -> None:

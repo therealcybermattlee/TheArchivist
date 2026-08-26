@@ -11,9 +11,12 @@ Cardinal rules, host-independent:
   keeps media — the working volume (~50 GB) is transient pass-through.
 - Only ONE host runs applying commands at a time (the Mac remains a
   fallback/dev host). Never run `--apply` operations from both.
-- Routine operation is frequent small pulls (`archivist pull icloud
-  --source X --apply` with stored window) plus periodic
-  `archivist prune-staging --apply`.
+- Routine operation is frequent small pulls (`archivist pull all --apply`,
+  or `pull icloud --source X --apply` for one account, both using the
+  stored window) plus periodic `archivist prune-staging --apply`.
+  `pull all` is the cron-shaped entry point: it exits non-zero if any
+  source failed, so a scheduled run surfaces problems instead of
+  silently skipping an account.
 
 ## 1. VM provisioning (reference deployment)
 
@@ -128,8 +131,8 @@ Cloud sessions do NOT migrate — re-auth per host (§2).
    `rsync -a mac:/Volumes/ExternalBaseUnit/TheArchivist/{catalog,logs}/ /srv/archivist-work/TheArchivist/`
 4. On the guest: `archivist status` — totals, location coverage, and the
    review queue MUST match the Mac's numbers exactly. Pull state rides in
-   the catalog, so bare `archivist pull icloud --source X` works
-   immediately.
+   the catalog, so bare `archivist pull icloud --source X` (or
+   `archivist pull all`) works immediately.
 5. The guest is now primary. The Mac remains a fallback: its catalog goes
    stale from this point — before EVER applying from the Mac again, rsync
    the state back or re-scan.
