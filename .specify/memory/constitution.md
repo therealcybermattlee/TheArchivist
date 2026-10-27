@@ -65,7 +65,24 @@ duplicates and are skipped, never re-filed. Duplicate decisions
 (skip/condemn) MUST be confirmed by full-content hash — a fast fingerprint
 alone is never sufficient for a destructive or skip decision.
 
-Rationale: "it's archived" must mean "the bytes are provably there."
+Amended 2026-09-28 (see Governance): for an INGEST SKIP decision, the source
+side MUST be hashed fresh, and the archived side MAY be settled from the
+catalog's recorded full-content hash provided the archived file is confirmed
+to exist and to still carry its recorded size. A sampled fraction of such
+decisions MUST re-read the archived bytes anyway, and an operator MUST be able
+to demand a full re-read. Where a re-read finds bytes that disagree with the
+catalog, the item MUST NOT be treated as a duplicate and the disagreement MUST
+be reported. This carve-out does NOT extend to condemn/delete decisions, which
+MUST re-read BOTH sides at the moment of deletion: the staged/condemned file
+and its archived counterpart. Skipping wrongly is survivable ONLY because the
+delete re-reads; the two are a single safety property split across two
+commands, and neither may be relaxed alone.
+
+Rationale: "it's archived" must mean "the bytes are provably there." The 2026
+amendment keeps that meaning for every WRITE while acknowledging that proving
+it again for every skip, on every run, is what made a 33,124-file
+reconciliation sweep a ~22-hour job — and an integrity ceremony nobody can
+afford to run is not an integrity ceremony.
 
 ### IV. Journal Before Destruction; the Catalog Is Derived
 
@@ -145,9 +162,37 @@ memory; 445 files and 270 GB were reclaimed under this ceremony with
   specs/templates, and versioned semantically — MAJOR for principle
   removals/redefinitions, MINOR for new principles or materially expanded
   guidance, PATCH for clarifications.
+- **2026-09-28, Principle III, ingest-skip carve-out (v1.1.0).** Feature 005's
+  first reconciliation sweep measured 25 files/minute because every
+  duplicate-skip re-read the archived copy over SMB: ~22 hours for one source,
+  against a working volume that must be pruned between sweeps. The operator
+  chose to settle the archived side from the catalog's recorded hash, guarded
+  by an existence and size check, a 1% re-read sample, and a `--verify-archive`
+  escape hatch. What is knowingly given up: same-size bit rot in the unsampled
+  99% goes undetected until the next `scan-archive`. What is kept: no write is
+  ever recorded unverified, and a detected mismatch files the item rather than
+  skipping it. Adopted by explicit amendment rather than reinterpretation, per
+  this section.
+
+  **Correction, same day, before any applying use.** As first drafted this
+  entry claimed "no condemn/delete decision is weakened" and justified the
+  carve-out on the grounds that "skipping wrongly costs a copy that still
+  exists in staging". Review proved both false. `prune-staging` is what empties
+  staging, and its primary branch classified a staged file as deletable from
+  the same catalog column, checking only that the archived file existed — it
+  never read the archived bytes. The ingest re-read had been the sole byte gate
+  in front of that delete, so removing it would have made same-size archive rot
+  destroy the only good copy, silently. The reasoning was wrong, not just the
+  wording: a safety property was being relied on across a module boundary with
+  nothing recording the dependency. `staging.apply` now re-reads the archived
+  counterpart before every unlink and refuses on mismatch (`ARCHIVE_MISMATCH`),
+  which is what Principle I's carve-out already required ("a byte-verified
+  archived copy is confirmed present AT THAT MOMENT") and what its primary
+  branch had never actually done. Pinned by
+  `tests/integration/test_ingest_prune_chain.py`.
 - Compliance review: `/speckit-plan`'s Constitution Check gate and
   `/speckit-analyze` (where principle conflicts are CRITICAL findings)
   are the enforcement points; `data-safety-reviewer`-style review applies
   to any new deletion path.
 
-**Version**: 1.0.0 | **Ratified**: 2026-07-31 | **Last Amended**: 2026-07-31
+**Version**: 1.1.0 | **Ratified**: 2026-07-31 | **Last Amended**: 2026-09-28

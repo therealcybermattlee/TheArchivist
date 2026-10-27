@@ -1,0 +1,6 @@
+2026-09-26 13:40:02 DEBUG    Authenticating...
+2026-09-26 13:40:03 INFO     Downloading the first original photo or video to /work/staging/icloud/demo ...
+2026-09-26 13:40:05 INFO     Downloaded /work/staging/icloud/demo/2026/09/IMG_1822.HEIC
+2026-09-26 13:40:07 DEBUG    /work/staging/icloud/demo/2026/09/IMG_1821.PNG already exists
+2026-09-26 13:40:08 DEBUG    Skipping IMG_8042.HEIC, as it was created 2025-01-12 14:06:52.743000-05:00, before 2026-09-19 00:00:00-04:00.
+2026-09-26 13:40:08 INFO     All photos and videos have been downloaded

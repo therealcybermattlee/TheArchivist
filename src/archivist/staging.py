@@ -9,7 +9,13 @@ first (JSONL), so an interrupted run is fully accounted for.
 
 Statuses (data-model.md, 004):
   verified-archived — sha256 matches a catalog row with an archive_path
-                      whose file exists on the mounted archive right now
+                      whose file exists on the mounted archive right now.
+                      PROVISIONAL: plan-time classification trusts the
+                      catalog's recorded hash. `apply` re-reads the archived
+                      bytes before each unlink and refuses on mismatch, so the
+                      byte guarantee is made where the deletion happens.
+  archive-mismatch  — apply-time only: the archived counterpart's bytes
+                      disagree with the staged file. Never deleted; reported.
   unverified        — no catalog match: may be the only copy; untouchable
   archived-missing  — catalog match but the archived file is absent:
                       archive-integrity question; refused loudly
@@ -32,6 +38,7 @@ from .scanner import is_noise
 VERIFIED = "verified-archived"
 UNVERIFIED = "unverified"
 ARCHIVED_MISSING = "archived-missing"
+ARCHIVE_MISMATCH = "archive-mismatch"
 OUTSIDE = "outside-staging"
 
 
@@ -175,6 +182,30 @@ def apply(prune_plan: PrunePlan, cfg: Config, run_id: str,
                     continue
                 if not (it.archive_path and Path(it.archive_path).is_file()):
                     res.refused[ARCHIVED_MISSING] = res.refused.get(ARCHIVED_MISSING, 0) + 1
+                    continue
+                # Byte-verify the archived counterpart AT THE MOMENT OF
+                # DELETION (constitution Principle I carve-out). Plan-time
+                # classification consults the catalog's recorded hash, which is
+                # fast but is a claim about the past; this is the only place
+                # that proves today's bytes, and it is the last point before
+                # the staged copy stops existing.
+                #
+                # This guard used to be supplied indirectly: ingest re-read
+                # every archived candidate, so a rotted archive file could
+                # never produce a `skip-duplicate` and therefore never produce
+                # a prunable staged file. Feature 005 removed that re-read for
+                # speed, which silently moved the burden here. Same-size rot in
+                # an archived file plus a trusting prune destroys the only good
+                # copy, so the check now lives where the deletion does.
+                staged_sha = sha256_file(f)
+                arc_sha = sha256_file(Path(it.archive_path))
+                if arc_sha != staged_sha:
+                    res.refused[ARCHIVE_MISMATCH] = res.refused.get(ARCHIVE_MISMATCH, 0) + 1
+                    res.errors.append((
+                        it.path,
+                        f"archived counterpart {it.archive_path} does not match "
+                        f"these bytes (archive {arc_sha[:16]}…, staged "
+                        f"{staged_sha[:16]}…) — KEPT. Run scan-archive."))
                     continue
                 # Journal BEFORE the unlink (constitution Principle IV).
                 mf.write(json.dumps({"run_id": run_id, "at": now,

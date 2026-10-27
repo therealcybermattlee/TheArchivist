@@ -173,6 +173,21 @@ class Catalog:
             )
         ]
 
+    def rows_for_quick_hash(self, conn: sqlite3.Connection, quick_hash: str):
+        """Archived (path, content_hash, file_size) sharing this quick_hash.
+
+        Carries the recorded full hash and size so a duplicate check can be
+        settled without re-reading the archived bytes over the network (005,
+        constitution Principle III as amended 2026-09-28).
+        """
+        return [
+            (r[0], r[1], r[2]) for r in conn.execute(
+                "SELECT archive_path, content_hash, file_size FROM assets "
+                "WHERE quick_hash=? AND archive_path IS NOT NULL",
+                (quick_hash,),
+            )
+        ]
+
     def upsert_by_archive_path(self, conn: sqlite3.Connection, record: dict) -> None:
         """Insert or replace the row for record['archive_path'].
 

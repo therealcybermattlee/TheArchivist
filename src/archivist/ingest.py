@@ -15,6 +15,7 @@ nothing.
 from __future__ import annotations
 
 import json
+import random
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -52,6 +53,9 @@ class PlannedFile:
 @dataclass
 class IngestPlan:
     files: list[PlannedFile] = field(default_factory=list)
+    #: (archive_path, recorded_sha, actual_sha) where the archived bytes no
+    #: longer match the catalog. Never silently skipped — surfaced loudly.
+    integrity_warnings: list[tuple[str, str, str]] = field(default_factory=list)
 
     @property
     def to_copy(self) -> list[PlannedFile]:
@@ -145,13 +149,50 @@ def _collision_free(
     return dst.with_name(f"{dst.stem}__{suffix}{dst.suffix}"), None
 
 
+#: Fraction of duplicate-skip decisions that re-read the archived bytes even
+#: when the catalog's recorded hash already settles them. Keeps silent same-size
+#: corruption statistically detectable rather than invisible between
+#: `scan-archive` runs (constitution Principle III, amended 2026-09-28).
+ARCHIVE_SPOT_CHECK_RATE = 0.01
+
+
 def plan(paths: list[Path], device_folder: str, catalog: Catalog,
-         archive_root: Path, tz: str) -> IngestPlan:
+         archive_root: Path, tz: str, *, verify_archive: bool = False,
+         spot_check_rate: float = ARCHIVE_SPOT_CHECK_RATE,
+         rng: random.Random | None = None, progress=None) -> IngestPlan:
+    """Plan an ingest. Reads only; writes nothing.
+
+    `verify_archive` forces the paranoid path: every duplicate-skip decision
+    re-reads the archived bytes. Otherwise a skip is settled by comparing the
+    freshly-hashed source against the catalog's recorded full hash, having first
+    confirmed the archived file exists and still has its recorded size — plus a
+    `spot_check_rate` sample that re-reads anyway. Re-reading every archived
+    copy over the network made a 33k-file sweep a ~22-hour job.
+    """
+    if not verify_archive and spot_check_rate <= 0:
+        raise ValueError(
+            "spot_check_rate must be > 0: the sample is the only routine check "
+            "that archived bytes still match the catalog. Pass "
+            "verify_archive=True to read every candidate instead.")
+    rng = rng or random.Random()
     groups = group_files(paths)
     all_members = [m for g in groups for m in g.members]
     metas = extract_batch(all_members) if all_members else {}
 
+    # One full read per file per run, however many candidates it is compared
+    # against. The old code re-hashed the same source inside the candidate loop
+    # and again when recording it.
+    sha_cache: dict[Path, str] = {}
+
+    def sha(path: Path) -> str:
+        got = sha_cache.get(path)
+        if got is None:
+            got = sha_cache[path] = sha256_file(path)
+        return got
+
     p = IngestPlan()
+    total_members = len(all_members)
+    seen = 0
     planned_dsts: set[str] = set()
     # Within-batch dedup (FR-022): quick_hash -> (planned dst, sha256) of files
     # already planned to copy in THIS run. Exactly one copy of identical
@@ -164,19 +205,50 @@ def plan(paths: list[Path], device_folder: str, catalog: Catalog,
             gloc = _group_location(g, metas)
             tdir = _target_dir(archive_root, dr.dt, device_folder)
             for m in g.members:
+                seen += 1
+                if progress is not None:
+                    progress(seen, total_members, m)
                 size = m.stat().st_size
                 qh = quick_hash(m)
-                existing = catalog.paths_for_quick_hash(conn, qh)
-                # Confirm a true duplicate by full hash before skipping.
+                # Confirm a true duplicate by full content hash before skipping
+                # (Principle III). The source is always hashed fresh; the
+                # archived side is settled from the catalog's recorded hash
+                # unless the file is missing, its size has drifted, this run
+                # verifies everything, or it falls in the spot-check sample.
                 dup = None
-                for ex in existing:
+                # Once any candidate's bytes disagree with the catalog, this
+                # content's catalog rows have been shown untrustworthy — so
+                # every remaining candidate for THIS file must be proven by a
+                # read, never settled from the same catalog.
+                distrust_catalog = verify_archive
+                for ex, stored_sha, stored_size in catalog.rows_for_quick_hash(conn, qh):
                     exp = Path(ex)
-                    if exp.is_file() and sha256_file(exp) == sha256_file(m):
-                        dup = ex
-                        break
+                    try:
+                        st = exp.stat()
+                    except OSError:
+                        continue       # archived copy gone: not a duplicate
+                    drifted = (stored_sha is None or stored_size is None
+                               or st.st_size != stored_size)
+                    sampled = rng.random() < spot_check_rate
+                    if distrust_catalog or drifted or sampled:
+                        archive_sha = sha256_file(exp)
+                        if archive_sha != stored_sha and stored_sha is not None:
+                            # The archived bytes no longer match what the
+                            # catalog recorded. Never skip on this: keep the
+                            # source and shout, because a wrong skip here plus a
+                            # later prune is how the only good copy disappears.
+                            p.integrity_warnings.append((ex, stored_sha, archive_sha))
+                            distrust_catalog = True
+                            continue
+                        if archive_sha != sha(m):
+                            continue
+                    elif stored_sha != sha(m):
+                        continue
+                    dup = ex
+                    break
                 if dup is None and qh in planned_content:
                     planned_dst, planned_sha = planned_content[qh]
-                    if sha256_file(m) == planned_sha:
+                    if sha(m) == planned_sha:
                         dup = planned_dst
                 if dup:
                     p.files.append(PlannedFile(
@@ -197,7 +269,7 @@ def plan(paths: list[Path], device_folder: str, catalog: Catalog,
                     ))
                     continue
                 planned_dsts.add(str(dst).casefold())
-                planned_content.setdefault(qh, (str(dst), sha256_file(m)))
+                planned_content.setdefault(qh, (str(dst), sha(m)))
                 p.files.append(PlannedFile(
                     str(m), str(dst), "copy", size,
                     dr.dt.isoformat(), dr.confidence, dr.source,

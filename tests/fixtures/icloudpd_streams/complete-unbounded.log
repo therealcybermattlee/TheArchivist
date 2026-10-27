@@ -1,0 +1,9 @@
+2026-09-26 13:34:41 DEBUG    Authenticating...
+2026-09-26 13:34:43 INFO     Downloading 2202 original photos and videos to /work/staging/icloud/demo ...
+2026-09-26 13:34:44 INFO     Downloaded /work/staging/icloud/demo/2026/09/IMG_1820.PNG
+2026-09-26 13:34:46 INFO     Downloaded /work/staging/icloud/demo/2026/09/IMG_1821.PNG
+2026-09-26 13:34:47 DEBUG    /work/staging/icloud/demo/2026/09/IMG_1819.HEIC already exists
+2026-09-26 13:34:48 DEBUG    Skipping IMG_8042.HEIC, as it was created 2025-01-12 14:06:52.743000-05:00, before 2026-09-19 00:00:00-04:00.
+2026-09-26 13:34:48 DEBUG    Skipping IMG_8041.HEIC, as it was created 2025-01-12 11:58:30.369000-05:00, before 2026-09-19 00:00:00-04:00.
+2026-09-26 13:34:49 DEBUG    Skipping IMG_8040.HEIC, as it was created 2025-01-12 11:43:42.099000-05:00, before 2026-09-19 00:00:00-04:00.
+2026-09-26 13:34:49 INFO     All photos and videos have been downloaded

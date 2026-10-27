@@ -13,10 +13,31 @@ work_subdir: "TheArchivist"                # all working files live under work_r
 
 default_timezone: "America/Detroit"        # US Eastern; UTC timestamps normalized to this for folder dates
 
+# --- iCloud pull tuning (005) ------------------------------------------------
+# Optional. Both may also be set per icloud source, which wins over these.
+#
+# scan_bound: how many of the most recently ADDED items a routine refresh
+#   examines before it stops. This bounds the SCAN, so a refresh costs what
+#   changed rather than what exists. If a source adds more than this between
+#   runs, the run says so and holds its coverage watermark rather than skipping
+#   anything -- raise it for that source and re-run.
+# reconcile_interval_days: how stale a source may get before the next routine
+#   refresh escalates it to a full, unbounded sweep. The sweep is what catches
+#   media added recently but CAPTURED long ago (old scans imported to iCloud),
+#   which no recency-bounded or date-windowed scan can see.
+scan_bound: 500
+reconcile_interval_days: 30
+# auto_reconcile: may a routine refresh escalate a stale source to a full
+#   sweep by itself? A sweep re-downloads the whole library (the mirror is
+#   transient), so on a small working volume set this false and schedule
+#   sweeps yourself. Either way the run REPORTS what is overdue — turning
+#   this off suppresses the sweep, never the warning.
+auto_reconcile: true
+
 # Source -> Level-3 device folder name. Every ingest pathway maps to one.
 sources:
   matt-personal:   { type: icloud,  device_folder: "Matt Personal Cell", username: "you@icloud.com" }
-  matt-public:     { type: icloud,  device_folder: "Matt Public Cell",   username: "you2@icloud.com" }
+  matt-public:     { type: icloud,  device_folder: "Matt Public Cell",   username: "you2@icloud.com" , scan_bound: 1500 }
   matt-takeout:    { type: takeout, device_folder: "Matt Public Cell" }
   gopro3:          { type: device,  device_folder: "GoPro3" }
   insta-go3:       { type: device,  device_folder: "Insta Go3" }

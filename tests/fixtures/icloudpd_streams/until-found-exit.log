@@ -1,0 +1,6 @@
+2026-09-26 13:50:00 DEBUG    Authenticating...
+2026-09-26 13:50:01 INFO     Downloading ??? original photos and videos to /work/staging/icloud/demo ...
+2026-09-26 13:50:02 DEBUG    /work/staging/icloud/demo/2026/09/IMG_1820.PNG already exists
+2026-09-26 13:50:02 DEBUG    /work/staging/icloud/demo/2026/09/IMG_1821.PNG already exists
+2026-09-26 13:50:03 DEBUG    /work/staging/icloud/demo/2026/09/IMG_1822.HEIC already exists
+2026-09-26 13:50:03 INFO     Found 3 consecutive previously downloaded photos. Exiting

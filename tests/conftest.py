@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+sys.path.insert(0, str(Path(__file__).parent / "integration"))
 
 from build_fixtures import build_all, tools_available  # noqa: E402
 
