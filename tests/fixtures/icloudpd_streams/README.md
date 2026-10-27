@@ -32,3 +32,35 @@ period-less `already exists` are now pinned here deliberately.
 No live iCloud account was contacted to build these. The parser must stay
 tolerant of wording it has not seen: anything it cannot positively confirm
 fails closed (`CoverageProof.parser_confident`).
+
+## Enumeration fixtures (feature 006)
+
+`enumeration-*.log` capture `--only-print-filenames` output, whose shape differs
+from an ordinary run's in three ways that matter:
+
+| Fixture | Represents |
+|---|---|
+| `enumeration-sample.log` | A healthy listing: absolute target paths, one per line, nothing else |
+| `enumeration-truncated.log` | A listing cut off mid-line — ends without a newline |
+| `enumeration-auth-error.log` | Valid paths followed by a failure **on stdout** |
+| `enumeration-empty.log` | A library with no items (legitimate when the run completed) |
+
+`enumeration-sample.log` is derived from a real listing of the `matt-public`
+library captured 2026-10-26 (6,100 lines, cancelled part-way). Filenames are
+replaced with synthetic `ASSET_NNNN` names; the **shape** is preserved — the
+`{:%Y/%m}` folder structure, HEIC+MOV live-photo pairing, and the colliding
+duplicate pair where two distinct assets map to one target path. No family
+filenames are committed.
+
+Three findings these fixtures exist to pin, all from that capture:
+
+1. **There is no completion sentence.** `All photos and videos have been
+   downloaded` is not emitted in this mode, so 005's primary completeness signal
+   is unavailable. Completeness is exit 0 + no failure signal + a final newline.
+2. **Errors arrive on stdout, interleaved with items.** Three accounts with
+   expired sessions wrote `Authentication required for Account. (421)` to
+   stdout, not stderr, even at `--log-level error`. A reader that assumed stdout
+   held only paths would have read that as a one-item library.
+3. **A listed path is not a unique key.** 6,100 lines held 6,087 unique paths;
+   the duplicates were adjacent pairs of distinct assets sharing a target path,
+   which the downloader resolves with a size suffix at fetch time.

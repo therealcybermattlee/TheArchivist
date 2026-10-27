@@ -20,6 +20,16 @@ SMALL_SCAN_BOUND_WARN = 50
 # its own. False means sweeps are operator-scheduled; the run still REPORTS
 # which sources are overdue, so turning this off cannot hide a growing gap.
 DEFAULT_AUTO_RECONCILE = True
+# 006. The cheap audit runs far more often than the unbounded sweep it replaces:
+# listing costs provider time but no bandwidth, so a week is affordable where 30
+# days was the most the old sweep could justify. The gap that prompted this
+# feature went unnoticed for 61 days.
+DEFAULT_AUDIT_INTERVAL_DAYS = 7
+# Small enough that an automatic repair cannot overrun the working volume, large
+# enough for an ordinary missed window: observed density is ~3.8 MB/file, so
+# 5 GB covers roughly 1,300 files against a busiest-source rate of ~280/month.
+DEFAULT_REPAIR_BUDGET_GB = 5.0
+DEFAULT_AUTO_REPAIR = True
 ENV_CONFIG = "ARCHIVIST_CONFIG"
 SENTINEL_NAME = ".archivist-volume-id"
 USER_CONFIG_DIR = Path.home() / ".config" / "archivist"
@@ -34,6 +44,9 @@ class Source:
     # 005: per-source overrides. None means "use the config default".
     scan_bound: int | None = None            # items a routine refresh examines
     reconcile_interval_days: int | None = None  # staleness before a full sweep
+    # 006 per-source overrides.
+    audit_interval_days: int | None = None      # staleness before a cheap audit
+    repair_budget_gb: float | None = None       # cap on an automatic repair
 
 
 @dataclass(frozen=True)
@@ -48,6 +61,23 @@ class Config:
     scan_bound: int = DEFAULT_SCAN_BOUND
     reconcile_interval_days: int = DEFAULT_RECONCILE_INTERVAL_DAYS
     auto_reconcile: bool = DEFAULT_AUTO_RECONCILE
+    # 006 defaults, overridable per source. See contracts/cli-audit.md.
+    audit_interval_days: int = DEFAULT_AUDIT_INTERVAL_DAYS
+    repair_budget_gb: float = DEFAULT_REPAIR_BUDGET_GB
+    auto_repair: bool = DEFAULT_AUTO_REPAIR
+
+    def audit_interval_for(self, source_key: str) -> int:
+        src = self.sources.get(source_key)
+        if src is not None and src.audit_interval_days is not None:
+            return src.audit_interval_days
+        return self.audit_interval_days
+
+    def repair_budget_bytes_for(self, source_key: str) -> int:
+        src = self.sources.get(source_key)
+        gb = self.repair_budget_gb
+        if src is not None and src.repair_budget_gb is not None:
+            gb = src.repair_budget_gb
+        return int(gb * 1024 ** 3)
 
     def scan_bound_for(self, source_key: str) -> int:
         src = self.sources.get(source_key)
@@ -185,6 +215,14 @@ def load_config(explicit: str | os.PathLike[str] | None = None) -> Config:
     scan_bound = _positive_int(raw, "scan_bound", DEFAULT_SCAN_BOUND, "top level")
     reconcile_interval_days = _positive_int(
         raw, "reconcile_interval_days", DEFAULT_RECONCILE_INTERVAL_DAYS, "top level")
+    audit_interval_days = _positive_int(
+        raw, "audit_interval_days", DEFAULT_AUDIT_INTERVAL_DAYS, "top level")
+    repair_budget_gb = _positive_number(
+        raw, "repair_budget_gb", DEFAULT_REPAIR_BUDGET_GB, "top level")
+    auto_repair = raw.get("auto_repair", DEFAULT_AUTO_REPAIR)
+    if not isinstance(auto_repair, bool):
+        raise ConfigError(
+            f"top level: 'auto_repair' must be true or false, got {auto_repair!r}")
     auto_reconcile = raw.get("auto_reconcile", DEFAULT_AUTO_RECONCILE)
     if not isinstance(auto_reconcile, bool):
         raise ConfigError(
@@ -198,7 +236,8 @@ def load_config(explicit: str | os.PathLike[str] | None = None) -> Config:
             stype = str(val["type"])
             # The 005 tunables mean nothing outside an icloud source; silently
             # ignoring one would hide a typo in a key that governs coverage.
-            for tunable in ("scan_bound", "reconcile_interval_days"):
+            for tunable in ("scan_bound", "reconcile_interval_days",
+                            "audit_interval_days", "repair_budget_gb"):
                 if tunable in val and stype != "icloud":
                     raise ConfigError(
                         f"Source '{key}' is type '{stype}' — '{tunable}' only "
@@ -212,6 +251,10 @@ def load_config(explicit: str | os.PathLike[str] | None = None) -> Config:
                 scan_bound=_positive_int(val, "scan_bound", None, f"source '{key}'"),
                 reconcile_interval_days=_positive_int(
                     val, "reconcile_interval_days", None, f"source '{key}'"),
+                audit_interval_days=_positive_int(
+                    val, "audit_interval_days", None, f"source '{key}'"),
+                repair_budget_gb=_positive_number(
+                    val, "repair_budget_gb", None, f"source '{key}'"),
             )
         except KeyError as exc:
             raise ConfigError(
@@ -228,7 +271,22 @@ def load_config(explicit: str | os.PathLike[str] | None = None) -> Config:
         scan_bound=scan_bound,
         reconcile_interval_days=reconcile_interval_days,
         auto_reconcile=auto_reconcile,
+        audit_interval_days=audit_interval_days,
+        repair_budget_gb=repair_budget_gb,
+        auto_repair=auto_repair,
     )
+
+
+def _positive_number(mapping: dict, key: str, default, where: str):
+    """Like _positive_int but accepts a fraction, for a budget in GB."""
+    if key not in mapping or mapping[key] is None:
+        return default
+    val = mapping[key]
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ConfigError(f"{where}: '{key}' must be a number, got {val!r}")
+    if val <= 0:
+        raise ConfigError(f"{where}: '{key}' must be greater than 0, got {val!r}")
+    return float(val)
 
 
 def _positive_int(mapping: dict, key: str, default, where: str) -> int | None:

@@ -854,11 +854,27 @@ class PullOutcome:
     reconcile_due_days: int | None = None   # None when never reconciled
     reconcile_stale: bool = False           # the fact the summary reports on
     integrity_warnings: int = 0
+    # 006: what the audit, if one ran, concluded about this source.
+    audit: object | None = None
 
     @property
     def ok(self) -> bool:
         """True when nothing about this source needs the operator's attention."""
         return self.status in ("ok", "idle", "partial")
+
+    @property
+    def audit_clause(self) -> str:
+        """What the summary line says about reconciliation (FR-021b)."""
+        a = self.audit
+        if a is None:
+            return ""
+        if getattr(a, "skipped", False):
+            return ", not re-audited"
+        if a.verdict == "reconciled":
+            return ", reconciled today"
+        if a.verdict == "incomplete":
+            return f", {a.missing:,} missing across {a.months} month(s)"
+        return ", audit unverified"
 
 
 _STATUS_STYLE = {
@@ -867,6 +883,8 @@ _STATUS_STYLE = {
     "partial":        ("PARTIAL ", typer.colors.YELLOW),
     "failed":         ("FAILED  ", typer.colors.RED),
     "bootstrap":      ("BOOTSTRP", typer.colors.MAGENTA),
+    "gap":            ("GAP     ", typer.colors.YELLOW),
+    "unverified":     ("UNVERIF ", typer.colors.RED),
     "config-invalid": ("CONFIG  ", typer.colors.RED),
 }
 
@@ -1092,6 +1110,361 @@ def _is_failure(reason: str | None) -> bool:
     return bool(reason) and any(m in reason for m in _FAILURE_MARKERS)
 
 
+# ---------------------------------------------------------------------------
+# Audit (feature 006)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AuditOutcome:
+    source: str
+    verdict: str = "unverified"          # reconciled | incomplete | unverified
+    listed: int = 0
+    archived: int = 0
+    missing: int = 0
+    months: int = 0
+    reason: str | None = None
+    advanced_to: str | None = None
+    skipped: bool = False                # inside the audit interval
+    needs_auth: bool = False
+    report: object | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.verdict == "reconciled" or self.skipped
+
+
+def _audit_one(cfg: Config, source: str, *, apply: bool = False,
+               show: int = 12, force: bool = False, repair: bool = False,
+               run_id: str | None = None) -> AuditOutcome:
+    """Enumerate one source and compare it against the archive.
+
+    Transfers no media. The expensive part is the listing -- 10-20 minutes of
+    provider queries for a large library -- and the whole point of the feature
+    is that this is all most reconciliations ever cost.
+    """
+    import time as _time
+    from datetime import datetime as _dt
+
+    from . import audit as au
+    from . import icloud
+    from .coverage import append_record, build_audit_record
+
+    src = _icloud_source(cfg, source)
+    cat = Catalog(cfg.catalog_db)
+    mirror = cfg.icloud_dir / source
+    run_id = run_id or _dt.now().strftime("%Y%m%d-%H%M%S")
+    started = _dt.now().replace(microsecond=0)
+    out = AuditOutcome(source=source)
+
+    interval = cfg.audit_interval_for(source)
+    last_audit = None
+    if cat.exists():
+        with cat.connect() as conn:
+            last_audit = cat.get_meta(conn, icloud.audit_state_key(source))
+    if not force and not au.is_audit_due(last_audit, started, interval):
+        out.skipped = True
+        out.reason = f"audited within the last {interval} day(s)"
+        return out
+
+    # The archive side first: it is free, and it is also what the mirror check
+    # needs in order to tell a staged-but-unfiled file from a filed one.
+    archived: set[str] = set()
+    if cat.exists():
+        with cat.connect() as conn:
+            archived = cat.recorded_source_paths(conn, str(mirror))
+
+    typer.echo(f"  listing ({src.username}) — no media transferred")
+    # A count-only ticker: the shared reporter derives an ETA from a total, and
+    # a listing has no total until it ends. Showing something matters because
+    # this step runs for 10-20 minutes with no other sign of life (FR-026).
+    tick = {"last": 0.0}
+
+    def _on_line(n: int) -> None:
+        now = _time.monotonic()
+        if now - tick["last"] < 5.0:
+            return
+        tick["last"] = now
+        typer.echo(f"  listed {n:,} so far...", err=True)
+
+    listing = icloud.enumerate_library(
+        src.username, mirror, cfg.icloud_session_dir, on_line=_on_line)
+
+    report = au.compare(source, listing, archived) if listing.complete else None
+    unfiled = au.mirror_has_unfiled_files(mirror, archived) if listing.complete else 0
+    verdict = au.decide_verdict(listing, report, checked_at=started,
+                                unfiled_in_mirror=unfiled)
+
+    out.verdict = verdict.verdict
+    out.reason = verdict.reason
+    out.listed = len(listing.paths)
+    out.report = report
+    if report is not None:
+        out.archived = report.archived
+        out.missing = report.missing_count
+        out.months = report.months_affected
+    out.needs_auth = any(
+        k in (verdict.reason or "")
+        for k in ("sign-in", "two-factor", "locked", "credentials", "expired"))
+
+    _render_audit(out, report, show=show)
+
+    repair_extra: dict = {}
+    if repair and apply and isinstance(verdict, au.Incomplete):
+        plan, decision = _plan_repair_for(cfg, source, report, archived)
+        _render_budget(plan, decision)
+        repair_extra = {
+            "ranges": [f"{a.isoformat()}..{b.isoformat()}" for a, b in plan.ranges],
+            "estimated_bytes": plan.estimated_bytes,
+            "budget_bytes": cfg.repair_budget_bytes_for(source),
+            "decision": decision.decision,
+        }
+        if isinstance(decision, au.Repair):
+            for first, last in plan.ranges:
+                typer.secho(f"  fetching {first:%Y-%m-%d}..{last:%Y-%m-%d}",
+                            bold=True)
+                # Both bounds set makes this NARROW under 005's rules, so it
+                # cannot advance the COVERAGE watermark -- correctly: fetching
+                # September proves nothing about the window as a whole. The
+                # reconciliation claim comes from the re-audit below, which is
+                # evidence about the whole library rather than one slice.
+                _pull_one(cfg, source, since=first.isoformat(),
+                          until=last.isoformat(), apply=True, show=0,
+                          run_id=run_id)
+
+            # Re-audit: the repair is only as good as what it actually filed.
+            with cat.connect() as conn:
+                archived = cat.recorded_source_paths(conn, str(mirror))
+            listing = icloud.enumerate_library(
+                src.username, mirror, cfg.icloud_session_dir, on_line=_on_line)
+            report = au.compare(source, listing, archived) if listing.complete else None
+            unfiled = (au.mirror_has_unfiled_files(mirror, archived)
+                       if listing.complete else 0)
+            verdict = au.decide_verdict(listing, report, checked_at=started,
+                                        unfiled_in_mirror=unfiled)
+            out.verdict = verdict.verdict
+            out.reason = verdict.reason
+            out.missing = report.missing_count if report is not None else 0
+            out.months = report.months_affected if report is not None else 0
+            repair_extra["missing_after"] = out.missing
+            typer.echo(f"  after repair: {out.missing:,} still missing")
+
+    advanced = None
+    if apply:
+        # Journal BEFORE the catalog write (Principle IV): an interruption
+        # between them must leave the claim recorded and the watermark stale,
+        # never the reverse.
+        if isinstance(verdict, au.Reconciled):
+            advanced = started
+        append_record(cfg.pull_journal_path(run_id), build_audit_record(
+            source=source, run_id=run_id, started=started,
+            finished=_dt.now().replace(microsecond=0),
+            listing=listing, report=report, verdict=verdict,
+            advanced_to=advanced,
+            kind="audit_repair" if repair_extra else "audit",
+            **repair_extra))
+        cat.init_db()
+        with cat.connect() as conn:
+            if verdict.verdict != "unverified":
+                # "We looked" advances even when the answer was "not clean";
+                # otherwise a source with a standing gap is re-enumerated on
+                # every single run forever.
+                cat.set_meta(conn, icloud.audit_state_key(source),
+                             started.isoformat())
+            if advanced is not None:
+                cat.set_meta(conn, icloud.reconcile_state_key(source),
+                             advanced.isoformat())
+            conn.commit()
+        if report is not None and report.missing:
+            listing_path = cfg.logs_dir / f"audit-{run_id}-{source}-missing.txt"
+            listing_path.parent.mkdir(parents=True, exist_ok=True)
+            listing_path.write_text("\n".join(report.missing) + "\n",
+                                    encoding="utf-8")
+            typer.echo(f"  full list: {listing_path}")
+        if advanced is not None:
+            out.advanced_to = advanced.isoformat()
+            typer.secho(f"  RECONCILED -> {out.advanced_to}",
+                        fg=typer.colors.GREEN)
+    elif isinstance(verdict, au.Reconciled):
+        typer.secho("  would reconcile (dry-run — no state written)",
+                    fg=typer.colors.GREEN)
+    return out
+
+
+def _render_audit(out: AuditOutcome, report, *, show: int) -> None:
+    if out.verdict == "unverified":
+        typer.secho(f"  could not verify: {out.reason}", fg=typer.colors.RED)
+        return
+    typer.echo(f"  listed {out.listed:,} items, archived {out.archived:,}")
+    if report is None or not report.missing_count:
+        typer.secho("  nothing missing", fg=typer.colors.GREEN)
+        return
+    # "(upper bound)" is not decoration. The count is an upper bound by
+    # construction -- duplicate target paths and collision suffixes inflate it
+    # -- and reading it as exact would invite chasing items that are archived.
+    typer.secho(f"  {report.missing_count:,} missing (upper bound)",
+                fg=typer.colors.YELLOW)
+    for month, n in report.month_lines()[:12]:
+        typer.echo(f"     {month}   {n:,}")
+    if report.undated:
+        typer.echo(f"     undated  {report.undated:,}")
+    if show and report.missing:
+        sample = ", ".join(report.missing[:show])
+        typer.echo(f"  sample: {sample}")
+
+
+def _plan_repair_for(cfg: Config, source: str, report, archived: set[str]):
+    """Build a RepairPlan and decide it against the budget."""
+    from . import audit as au
+
+    cat = Catalog(cfg.catalog_db)
+    mirror = cfg.icloud_dir / source
+    median = None
+    if cat.exists():
+        with cat.connect() as conn:
+            median = cat.median_file_size(conn, str(mirror))
+
+    # Everything already held in the affected months crosses the wire too: a
+    # date-bounded fetch takes dates, not an item list.
+    archived_by_month: dict[str, int] = {}
+    for rel in archived:
+        m = au.month_of(rel)
+        if m in report.by_month:
+            archived_by_month[m] = archived_by_month.get(m, 0) + 1
+
+    plan = au.plan_repair(report, median_size=median,
+                          archived_by_month=archived_by_month)
+    return plan, au.decide_budget(plan, cfg.repair_budget_bytes_for(source),
+                                  auto_repair=cfg.auto_repair)
+
+
+def _render_budget(plan, decision) -> None:
+    from . import audit as au
+
+    span = ", ".join(f"{a:%Y-%m-%d}..{b:%Y-%m-%d}" for a, b in plan.ranges)
+    est = ("unknown" if plan.estimated_bytes is None
+           else f"{plan.estimated_bytes / 1024 ** 3:.2f} GB")
+    typer.echo(f"  repair would fetch {span} "
+               f"({plan.expected_items:,} items, ~{est})")
+    if isinstance(decision, au.Repair):
+        typer.secho("  within budget — repairing", fg=typer.colors.CYAN)
+    else:
+        typer.secho(f"  not repairing: {decision.reason}", fg=typer.colors.YELLOW)
+
+
+@app.command()
+def audit(
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="One iCloud source key."),
+    all_sources: bool = typer.Option(False, "--all", help="Audit every iCloud source."),
+    apply: bool = typer.Option(False, "--apply", help="Write state (default: report only)."),
+    force: bool = typer.Option(False, "--force", help="Audit even if inside the interval."),
+    repair: bool = typer.Option(False, "--repair", help="Fetch the affected periods when within budget (needs --apply)."),
+    show: int = typer.Option(12, "--show", help="Sample missing paths to print."),
+    config: Optional[str] = ConfigOpt,
+) -> None:
+    """Ask a source what it holds, and compare it against the archive.
+
+    Transfers no media. An empty difference proves the source complete and
+    reconciles it; anything else is reported with where it clusters.
+
+    This replaces the full re-download sweep, which paid ~246 GB across four
+    accounts every interval to discover, in September 2026, 19 new files.
+    """
+    from datetime import datetime as _dt
+
+    from . import icloud
+
+    cfg = _load(config)
+    if bool(source) == bool(all_sources):
+        typer.secho("Give exactly one of --source or --all.",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    if repair and not apply:
+        typer.secho("--repair fetches media, so it requires --apply.",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    _require(cfg)
+
+    keys = ([k for k, v in cfg.sources.items() if v.type == "icloud"]
+            if all_sources else [source])
+    run_id = _dt.now().strftime("%Y%m%d-%H%M%S")
+    outcomes: list[AuditOutcome] = []
+    for key in keys:
+        typer.secho(f"\n=== {key} ===", bold=True)
+        try:
+            outcomes.append(_audit_one(cfg, key, apply=apply, show=show,
+                                       force=force, repair=repair,
+                                       run_id=run_id))
+        except icloud.ICloudError as exc:
+            typer.secho(f"  {exc}", fg=typer.colors.RED, err=True)
+            outcomes.append(AuditOutcome(source=key, reason=str(exc)))
+
+    if len(outcomes) > 1:
+        typer.secho("\nAudit summary", bold=True)
+        for o in outcomes:
+            if o.skipped:
+                typer.secho(f"  SKIPPED  {o.source:<16} {o.reason}",
+                            fg=typer.colors.BRIGHT_BLACK)
+            elif o.verdict == "reconciled":
+                typer.secho(f"  CLEAN    {o.source:<16} {o.listed:,} items, nothing missing",
+                            fg=typer.colors.GREEN)
+            elif o.verdict == "incomplete":
+                typer.secho(f"  GAP      {o.source:<16} {o.missing:,} missing "
+                            f"across {o.months} month(s)", fg=typer.colors.YELLOW)
+            else:
+                typer.secho(f"  UNVERIF  {o.source:<16} {o.reason}",
+                            fg=typer.colors.RED)
+
+    if any(not o.ok for o in outcomes):
+        raise typer.Exit(code=1)
+
+
+def _maybe_audit(cfg: Config, source: str, out: PullOutcome, *, apply: bool,
+                 audit_mode: str, run_id: str) -> PullOutcome:
+    """Audit one source after its pull, if it is due.
+
+    Deliberately OUTSIDE _pull_one: coverage advancement is 005's decision
+    table and gains nothing from knowing about audits. Here the audit merely
+    annotates an outcome that is already final.
+
+    A source whose pull failed is not audited — enumerating a library we could
+    not even reach wastes ten minutes to reach the same conclusion.
+    """
+    if audit_mode == "never" or out.status in ("failed", "config-invalid"):
+        return out
+    # Check the credentials locally first. Enumeration would refuse anyway, but
+    # only after probing the downloader's version, and this runs once per source
+    # on every routine refresh.
+    from . import icloud as _ic
+    src = cfg.sources.get(source)
+    if src is None or not src.username:
+        return out
+    if not _ic.session_status(cfg.icloud_session_dir, src.username)[0]:
+        return out
+    try:
+        res = _audit_one(cfg, source, apply=apply, show=0,
+                         force=(audit_mode == "always"),
+                         repair=(apply and cfg.auto_repair), run_id=run_id)
+    except Exception as exc:                       # never let an audit break a pull
+        typer.secho(f"  audit skipped: {exc}", fg=typer.colors.YELLOW, err=True)
+        return out
+    out.audit = res
+    if res.skipped:
+        return out
+    if res.verdict == "reconciled":
+        out.reconciled = True
+        out.reconcile_stale = False
+    elif res.verdict == "incomplete" and out.status in ("ok", "idle"):
+        # A real hole in the archive is something the operator must see.
+        out.status = "gap"
+    # An UNVERIFIED audit deliberately does NOT downgrade the pull. The pull
+    # did its work and proved its window; failing to also prove the whole
+    # library is weaker news than failing to pull, and conflating them would
+    # make a flaky audit look like a broken refresh. It still shows up in the
+    # summary clause, so it cannot pass unnoticed.
+    return out
+
+
 @pull_app.command("icloud")
 def pull_icloud(
     source: str = typer.Option(..., "--source", "-s", help="iCloud source key from config."),
@@ -1104,6 +1477,8 @@ def pull_icloud(
     apply: bool = typer.Option(False, "--apply", help="Write to the archive (default: download + dry-run ingest)."),
     verbose: bool = typer.Option(False, "--verbose", help="Show icloudpd's raw per-item output."),
     no_reconcile: bool = typer.Option(False, "--no-reconcile", help="Never escalate to a full sweep, even if this source is due."),
+    no_audit: bool = typer.Option(False, "--no-audit", help="Skip the coverage audit for this run."),
+    force_audit: bool = typer.Option(False, "--audit", help="Audit even if inside the audit interval."),
     verify_archive: bool = typer.Option(False, "--verify-archive", help="Re-read every archived candidate to confirm a duplicate (slow; default trusts the catalog's recorded hash plus a 1% sample)."),
     show: int = typer.Option(12, "--show", help="Sample rows to print."),
     config: Optional[str] = ConfigOpt,
@@ -1137,8 +1512,75 @@ def pull_icloud(
                     until_found=until_found, full=full, no_download=no_download,
                     apply=apply, show=show, verbose=verbose,
                     no_reconcile=no_reconcile, verify_archive=verify_archive)
+    # An explicitly bounded pull is a deliberate slice, not a routine refresh;
+    # auditing after one would charge the operator ten minutes they did not ask
+    # for. --audit still forces it.
+    explicit = any(v is not None for v in (recent, since, until, until_found))
+    if not (explicit or full or no_download) or force_audit:
+        from datetime import datetime as _dt
+        out = _maybe_audit(
+            cfg, source, out, apply=apply,
+            audit_mode=("never" if no_audit else
+                        "always" if force_audit else "due"),
+            run_id=_dt.now().strftime("%Y%m%d-%H%M%S"))
     if not out.ok:
         raise typer.Exit(code=1 if out.status != "config-invalid" else 2)
+
+
+def _needs_auth(o: PullOutcome) -> bool:
+    text = (o.detail or "") + " " + ((o.audit.reason or "") if o.audit else "")
+    return any(k in text for k in ("two-factor", "sign in again", "sign-in",
+                                   "locked", "credentials", "session"))
+
+
+def _render_advice(outcomes: list[PullOutcome], cfg: Config) -> None:
+    """One ranked block of advice, not four competing suggestions.
+
+    On 2026-10-26 three sources needed re-authentication and the headline
+    advice was to sweep the one healthy source. The operator should never have
+    to work out which of several suggestions is the one blocking them, so the
+    first non-empty category gets the commands and the rest get a line.
+    """
+    def _age(o: PullOutcome) -> str:
+        return (f"{o.reconcile_due_days}d" if o.reconcile_due_days is not None
+                else "never")
+
+    reauth = [o for o in outcomes if not o.ok and _needs_auth(o)]
+    unverified = [o for o in outcomes
+                  if o.status == "unverified" or
+                  (o.audit is not None and o.audit.verdict == "unverified"
+                   and o not in reauth)]
+    gaps = [o for o in outcomes if o.status == "gap"]
+    bootstrap = [o for o in outcomes if o.status == "bootstrap"]
+    # A source reconciled by a clean audit is not also overdue for a sweep:
+    # the audit discharged the same obligation, far more cheaply.
+    overdue = [o for o in outcomes if o.reconcile_stale and not o.reconciled]
+
+    categories = [
+        (reauth, "re-authenticate, then re-run",
+         lambda o: f"      archivist auth icloud --source {o.source}"),
+        (gaps, "repair the archive gap(s)",
+         lambda o: f"      archivist audit --source {o.source} --apply --repair"),
+        (bootstrap, "bootstrap the never-pulled source(s)",
+         lambda o: f"      archivist pull icloud --source {o.source} --full --apply"),
+        (unverified, "audit could not verify these — check the reason above",
+         None),
+        (overdue, "reconciliation due (sweep one at a time, pruning between)",
+         lambda o: f"      archivist pull icloud --source {o.source} --full --apply"),
+    ]
+
+    first = True
+    for group, heading, cmd in categories:
+        if not group:
+            continue
+        names = ", ".join(
+            f"{o.source}" + (f" ({_age(o)})" if group is overdue else "")
+            for o in group)
+        typer.secho(f"\n  {heading}: {names}", fg=typer.colors.YELLOW)
+        if first and cmd is not None:
+            for o in group:
+                typer.echo(cmd(o))
+        first = False
 
 
 @pull_app.command("all")
@@ -1147,6 +1589,8 @@ def pull_all(
     show: int = typer.Option(6, "--show", help="Sample rows to print per source."),
     verbose: bool = typer.Option(False, "--verbose", help="Show icloudpd's raw per-item output."),
     no_reconcile: bool = typer.Option(False, "--no-reconcile", help="Never escalate to a full sweep this run (still reports what is overdue)."),
+    no_audit: bool = typer.Option(False, "--no-audit", help="Skip the coverage audit this run."),
+    force_audit: bool = typer.Option(False, "--audit", help="Audit every source, even inside the audit interval."),
     verify_archive: bool = typer.Option(False, "--verify-archive", help="Re-read every archived candidate to confirm a duplicate (slow; default trusts the catalog's recorded hash plus a 1% sample)."),
     stop_on_error: bool = typer.Option(False, "--stop-on-error", help="Abort at the first failing source (default: continue)."),
     config: Optional[str] = ConfigOpt,
@@ -1194,6 +1638,10 @@ def pull_all(
         except Exception as exc:                # never let one source sink the run
             typer.secho(f"  unexpected error: {exc}", fg=typer.colors.RED, err=True)
             out = PullOutcome(key, "failed", str(exc))
+        out = _maybe_audit(cfg, key, out, apply=apply,
+                           audit_mode=("never" if no_audit else
+                                       "always" if force_audit else "due"),
+                           run_id=run_id)
         outcomes.append(out)
         if not out.ok and stop_on_error:
             typer.secho("Stopping (--stop-on-error).", fg=typer.colors.RED, err=True)
@@ -1209,31 +1657,24 @@ def pull_all(
                 cover = f"covered + reconciled {o.advanced_to[:10]}"
             line += (f"copied {o.copied} ({_gb(o.copied_bytes)}), {cover}"
                      if o.copied else f"nothing new, {cover}")
+            line += o.audit_clause
         elif o.status == "partial":
             line += f"copied {o.copied} ({_gb(o.copied_bytes)}), coverage held"
+            line += o.audit_clause
+        elif o.status == "gap":
+            a = o.audit
+            line += (f"pull fine — archive is missing {a.missing:,} item(s) "
+                     f"across {a.months} month(s)")
+        elif o.status == "unverified":
+            line += f"pull fine — audit could not verify: {o.audit.reason}"
         else:
             line += o.detail or o.status
         typer.secho(line, fg=color)
         if o.status == "partial" and o.detail:
             typer.secho(f"           {o.detail}", fg=color)
 
-    overdue = [o for o in outcomes if o.reconcile_stale and not o.reconciled]
-    if overdue:
-        def _age(o: PullOutcome) -> str:
-            return f"{o.reconcile_due_days}d" if o.reconcile_due_days is not None else "never"
-        typer.secho("\n  reconciliation due: "
-                    + ", ".join(f"{o.source} ({_age(o)})" for o in overdue),
-                    fg=typer.colors.YELLOW)
-        typer.echo("    sweep one at a time, pruning between:")
-        typer.echo(f"      archivist pull icloud --source {overdue[0].source} --full --apply")
-        typer.echo("      archivist prune-staging --apply")
-
     bad = [o for o in outcomes if not o.ok]
-    missing = [o.source for o in outcomes if o.status == "bootstrap"]
-    if missing:
-        typer.echo("\nBootstrap the never-pulled source(s) first, e.g.:")
-        for m in missing:
-            typer.echo(f"  archivist pull icloud --source {m} --full --apply")
+    _render_advice(outcomes, cfg)
     rotted = sum(o.integrity_warnings for o in outcomes)
     if rotted:
         typer.secho(

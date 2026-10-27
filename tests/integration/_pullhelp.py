@@ -101,3 +101,42 @@ def fresh(days_ago: int = 0) -> str:
     from datetime import timedelta
     return (datetime.now() - timedelta(days=days_ago)).replace(
         microsecond=0).isoformat()
+
+
+# --- 006 helpers -----------------------------------------------------------
+
+def mock_enumerate(calls, *, paths=(), complete=True, notes=(), per_user=None):
+    """Stand in for icloud.enumerate_library, recording each invocation."""
+    from archivist.icloud import Listing
+    per_user = per_user or {}
+
+    def fake(username, mirror, session_dir, version=None, on_line=None):
+        calls.append({"username": username, "mirror": Path(mirror)})
+        if username in per_user:
+            return per_user[username]
+        return Listing(paths=frozenset(paths), listed_lines=len(tuple(paths)),
+                       complete=complete, notes=tuple(notes))
+
+    return fake
+
+
+def seed_assets(cfg, source: str, relatives, *, size: int = 4 * 1024 * 1024):
+    """Record `relatives` as filed from `source`, as ingest would have."""
+    cat = Catalog(cfg.catalog_db)
+    mirror = cfg.icloud_dir / source
+    with cat.connect() as conn:
+        for rel in relatives:
+            # Key off the relative path, not an index: upsert replaces by
+            # archive_path, so index-derived names make a second seeding
+            # OVERWRITE the first instead of adding to it.
+            ident = rel.replace("/", "_")
+            cat.upsert_by_archive_path(conn, {
+                "quick_hash": f"q{source}{ident}",
+                "content_hash": f"c{source}{ident}",
+                "source_label": source,
+                "original_path": str(mirror / rel),
+                "archive_path": str(cfg.archive_root / source / ident),
+                "file_size": size,
+                "ingested_at": datetime.now().isoformat(),
+            })
+        conn.commit()

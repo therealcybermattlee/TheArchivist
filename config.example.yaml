@@ -27,7 +27,16 @@ default_timezone: "America/Detroit"        # US Eastern; UTC timestamps normaliz
 #   which no recency-bounded or date-windowed scan can see.
 scan_bound: 500
 reconcile_interval_days: 30
-# auto_reconcile: may a routine refresh escalate a stale source to a full
+# # Reconciliation audit (006). Listing a library costs provider time but NO
+# bandwidth, which is what makes a weekly check affordable where the old
+# re-download sweep (~246 GB across four accounts) could only justify 30 days.
+# An audit compares what the library holds against what the archive recorded
+# and advances the reconciliation watermark when nothing is missing.
+audit_interval_days: 7        # audit a source if it has not been audited in N days
+repair_budget_gb: 5           # cap on an AUTOMATIC repair; larger gaps are reported
+auto_repair: true             # false reduces a detected gap to report-only
+
+auto_reconcile: may a routine refresh escalate a stale source to a full
 #   sweep by itself? A sweep re-downloads the whole library (the mirror is
 #   transient), so on a small working volume set this false and schedule
 #   sweeps yourself. Either way the run REPORTS what is overdue — turning

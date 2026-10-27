@@ -60,6 +60,16 @@ def coverage_key(source_key: str) -> str:
     return f"coverage:{source_key}"
 
 
+def audit_state_key(source_key: str) -> str:
+    """When this source was last ENUMERATED, clean or not.
+
+    Distinct from reconcile_state, which records when it was last proven clean.
+    A source with a standing gap advances this one and not that one, so it is
+    re-examined on the audit interval rather than on every single run.
+    """
+    return f"audit_state:{source_key}"
+
+
 def window_since(last_pull_iso: str) -> str:
     """The --skip-created-before date for a routine windowed pull."""
     last = datetime.fromisoformat(last_pull_iso)
@@ -130,6 +140,14 @@ _RE_UNTIL_FOUND = re.compile(
 #:   logger.info("Two-factor authentication is required (2fa)")
 #:   logger.info("Two-step authentication is required (2sa)")
 _RE_MFA_REQUIRED = re.compile(r"Two-(?:factor|step) authentication is required")
+#: Failure signals transcribed from REAL captured output, not documentation.
+#: All three were observed on stdout -- not stderr -- at --log-level error,
+#: interleaved with item lines (research R2). A reader that assumed stdout held
+#: only paths would have read a 33,000-item library as holding one item.
+_RE_AUTH_REQUIRED = re.compile(r"Authentication required for Account")
+_RE_ACCOUNT_LOCKED = re.compile(
+    r"Apple Account has been\s*locked|iforgot\.apple\.com")
+_RE_BAD_CREDENTIALS = re.compile(r"Invalid email/password combination")
 _RE_ALREADY = re.compile(r"already exists\b")
 _RE_DOWNLOADED_ITEM = re.compile(r"\bDownloaded\b")
 _RE_DOWNLOAD_PREAMBLE = re.compile(
@@ -527,3 +545,160 @@ def download(username: str, mirror: Path, session_dir: Path,
     return build_proof(tally, exit_code=proc.returncode,
                        session_present_before=True, version=version,
                        truncated=truncated)
+
+
+# ---------------------------------------------------------------------------
+# Enumeration (feature 006)
+# ---------------------------------------------------------------------------
+#
+# `--only-print-filenames` asks the library what it holds and transfers nothing.
+# That makes reconciliation a question rather than a download: the paths it
+# prints are byte-identical to what the catalog recorded when the item was
+# filed, so set-differencing the two answers "is anything missing" for free.
+#
+# Three facts from the captured output shape everything below, none of them
+# documented upstream (see contracts/enumeration.md):
+#
+#   1. There is NO completion sentence in this mode. 005's primary signal is
+#      simply absent, so completeness has to be reconstructed from exit status,
+#      the absence of failure signals, and an unbroken final line.
+#   2. Failures arrive on STDOUT, mixed in with item lines.
+#   3. A printed path is not a unique asset key -- two assets can map to one
+#      target path, which the downloader resolves with a size suffix at fetch
+#      time. 6,100 captured lines held 6,087 unique paths.
+
+
+@dataclass(frozen=True)
+class Listing:
+    """What one enumeration produced, and whether it may be trusted.
+
+    `complete` carries the same weight here that `parser_confident` does in
+    CoverageProof: false means this listing is evidence of NOTHING, and in
+    particular an empty `paths` must never be read as "the library is empty".
+    """
+
+    paths: frozenset[str] = frozenset()
+    listed_lines: int = 0
+    complete: bool = False
+    exit_code: int = 0
+    notes: tuple[str, ...] = ()
+
+    def note_text(self) -> str:
+        return "; ".join(self.notes) if self.notes else "no detail recorded"
+
+
+def build_enumerate_cmd(username: str, mirror: Path, session_dir: Path) -> list[str]:
+    """Arguments for a listing run.
+
+    The media-shaping flags MUST match build_download_cmd exactly. If the folder
+    structure or the live-photo naming policy diverge, the listing produces
+    paths the archive could never have recorded and every single item reads as
+    missing -- a 100% false gap rather than a subtle one.
+    """
+    return _base_cmd(username, mirror, session_dir) + [
+        "--password-provider", "keyring",
+        "--size", "original",
+        "--live-photo-size", "original",
+        "--live-photo-mov-filename-policy", "original",
+        "--folder-structure", "{:%Y/%m}",
+        "--no-progress-bar",
+        # error, not debug: in this mode stdout is the DATA channel. Lowering
+        # the level keeps log noise out of the path stream; genuine failures
+        # still arrive here, which is why they are matched explicitly.
+        "--log-level", "error",
+        "--only-print-filenames",
+    ]
+
+
+def parse_enumeration(lines: Iterable[str], *, mirror: Path, exit_code: int = 0,
+                      truncated: bool = False, version: str | None = "1.32.3",
+                      session_detail: str | None = None) -> Listing:
+    """Classify a listing stream into a Listing. Pure; the tests drive it."""
+    prefix = str(mirror).rstrip("/") + "/"
+    notes: list[str] = []
+    paths: set[str] = set()
+    seen = 0
+
+    for line in lines:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        seen += 1
+        if line.startswith(prefix):
+            # A positive prefix test, never a negative "doesn't look like a
+            # log line" test: an unrecognised failure must not become an item.
+            paths.add(line[len(prefix):])
+            continue
+        if _RE_ACCOUNT_LOCKED.search(line):
+            notes.append("the account is locked — unlock it at "
+                         "https://iforgot.apple.com before retrying")
+        elif _RE_BAD_CREDENTIALS.search(line):
+            notes.append("iCloud rejected the stored credentials")
+        elif _RE_AUTH_REQUIRED.search(line):
+            notes.append("iCloud requires a fresh sign-in")
+        elif _RE_MFA_REQUIRED.search(line):
+            notes.append("iCloud asked for a two-factor code, which this "
+                         "non-interactive path cannot answer")
+        elif " ERROR " in line:
+            notes.append(f"downloader reported an error: {line.strip()[:120]}")
+
+    if session_detail is not None:
+        notes.append(session_detail)
+    if version is None:
+        notes.append("icloudpd version could not be determined")
+    elif version not in TESTED_ICLOUDPD_VERSIONS:
+        notes.append(
+            f"icloudpd {version} is not a version this listing parser has been "
+            f"checked against (tested: {', '.join(sorted(TESTED_ICLOUDPD_VERSIONS))})")
+    if exit_code != 0:
+        notes.append(f"icloudpd exited {exit_code}")
+    if truncated:
+        notes.append("listing ended mid-line")
+
+    return Listing(paths=frozenset(paths), listed_lines=seen,
+                   complete=not notes, exit_code=exit_code,
+                   notes=tuple(notes))
+
+
+def enumerate_library(username: str, mirror: Path, session_dir: Path, *,
+                      version: str | None = None,
+                      on_line: Callable[[int], None] | None = None) -> Listing:
+    """List what the library holds. Transfers no media and writes no files.
+
+    Costs 10-20 minutes of provider queries for 30-40k items and zero bytes,
+    which is the whole economic argument for feature 006.
+    """
+    if not icloudpd_available():
+        raise ICloudError("icloudpd not found on PATH (uv tool install icloudpd)")
+    if version is None:
+        version = probe_version()
+
+    # Local, per-account, and before any network contact: an audit is meant to
+    # run often and must never be able to contribute to an account lockout.
+    session_ok, session_why = session_status(session_dir, username)
+    if not session_ok:
+        return parse_enumeration([], mirror=mirror, version=version,
+                                 session_detail=session_why)
+
+    cmd = build_enumerate_cmd(username, mirror, session_dir)
+    collected: list[str] = []
+    truncated = False
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, bufsize=1,
+    )
+    try:
+        for raw in proc.stdout:
+            truncated = not raw.endswith("\n")
+            collected.append(raw)
+            if on_line is not None:
+                on_line(len(collected))
+    except BaseException:
+        proc.kill()
+        raise
+    finally:
+        proc.wait()
+
+    return parse_enumeration(collected, mirror=mirror, exit_code=proc.returncode,
+                             truncated=truncated, version=version)

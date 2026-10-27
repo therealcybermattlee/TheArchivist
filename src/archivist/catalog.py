@@ -188,6 +188,49 @@ class Catalog:
             )
         ]
 
+    def recorded_source_paths(self, conn: sqlite3.Connection,
+                              mirror_prefix: str) -> set[str]:
+        """Mirror-relative original_path for every item filed from one source.
+
+        Prefix filtering is a CORRECTNESS requirement, not an optimisation. All
+        iCloud sources share one staging tree, so an unfiltered query would let
+        one account's rows mark another account's items present — the same
+        defect class as a session check that asked whether *any* account had
+        signed in.
+
+        Returned relative to the prefix so a remount under a different name
+        cannot present an entire library as missing.
+        """
+        prefix = mirror_prefix.rstrip("/") + "/"
+        like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        return {
+            r[0][len(prefix):]
+            for r in conn.execute(
+                "SELECT original_path FROM assets "
+                "WHERE original_path LIKE ? ESCAPE '\\'", (like,))
+            if r[0] and r[0].startswith(prefix)
+        }
+
+    def median_file_size(self, conn: sqlite3.Connection,
+                         mirror_prefix: str) -> int | None:
+        """Median archived size for one source, or None if it has filed nothing.
+
+        Feeds the repair estimate. None is meaningful: with no basis for an
+        estimate the budget check must treat the repair as too large rather
+        than waving it through (006 FR-030).
+        """
+        prefix = mirror_prefix.rstrip("/") + "/"
+        like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        sizes = [
+            r[0] for r in conn.execute(
+                "SELECT file_size FROM assets "
+                "WHERE original_path LIKE ? ESCAPE '\\' AND file_size > 0 "
+                "ORDER BY file_size", (like,))
+        ]
+        if not sizes:
+            return None
+        return sizes[len(sizes) // 2]
+
     def upsert_by_archive_path(self, conn: sqlite3.Connection, record: dict) -> None:
         """Insert or replace the row for record['archive_path'].
 

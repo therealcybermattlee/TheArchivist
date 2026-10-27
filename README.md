@@ -116,6 +116,46 @@ Working storage is a small transient pass-through (~50 GB budget — shown in
 `status`); media's permanent home is always the TrueNAS archive. Only one
 host runs `--apply` operations at a time.
 
+### Reconciliation: asking instead of downloading
+
+A coverage watermark is a claim about when an item was **created**, but a cloud
+library is mutable in created time. An asset created in 2019 and added to the
+library today is filtered out by every future window, because the watermark
+only moves forward. Scanned prints, shared-album saves, old-device imports —
+for a family archive those backdated additions are much of the point, and
+reconciliation is the only thing that re-examines ground already claimed.
+
+It used to do that by re-downloading the library: the mirror gets pruned, so
+the downloader had nothing local to compare against. ~246 GB across four
+accounts, several hours, paid every interval — which in September 2026 bought
+the discovery of 19 new files.
+
+`audit` replaces the download with a question:
+
+```bash
+uv run archivist audit --source X                   # report only, no media moved
+uv run archivist audit --source X --apply           # reconcile if nothing is missing
+uv run archivist audit --source X --apply --repair  # fetch the affected months
+uv run archivist audit --all --apply
+```
+
+It lists what the library holds (no bandwidth, 10–20 minutes for a large one),
+compares that against the paths the catalog recorded when each item was filed,
+and reconciles the source when the difference is empty. A gap is reported with
+the months it falls in; within `repair_budget_gb` it is fetched by date range
+rather than by sweeping.
+
+`pull all` does this itself, at most once per `audit_interval_days` (7) per
+source, so every branch of a routine refresh is bounded. `--no-audit` skips it,
+`--audit` forces it.
+
+**The count is an upper bound, always.** Two assets can map to one target path,
+and an item filed as a duplicate is recorded under the earlier copy's path;
+both make an archived item look missing. The comparison is built to err that
+way — a false "missing" costs a redundant fetch that the hash check discards,
+while a false "present" would mark a source reconciled when it is not, which is
+the failure 005 exists to prevent.
+
 ## Tests
 ```bash
 uv run pytest    # unit + integration; uses tmp-dir fake volumes, never /Volumes/*

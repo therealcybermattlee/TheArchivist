@@ -1,3 +1,3 @@
 {
-  "feature_directory": "specs/005-bounded-icloud-pull"
+  "feature_directory": "specs/006-reconcile-by-diff"
 }

@@ -265,3 +265,72 @@ def append_record(journal_path: Path, record: CoverageRecord) -> None:
         fh.write(record.to_json() + "\n")
         fh.flush()
         os.fsync(fh.fileno())
+
+
+# ---------------------------------------------------------------------------
+# Audit records (feature 006)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AuditRecord:
+    """One source's audit in one run — written for EVERY audit, not only clean ones.
+
+    A refusal is as much a record as an advance: the journal is the evidence
+    that a reconciliation claim was examined, so "we looked and could not tell"
+    has to be as durable as "we looked and it was clean". Otherwise the only
+    audits with a paper trail are the ones that succeeded, which is the shape
+    of record-keeping that let an unproven claim become a watermark in the
+    first place.
+    """
+
+    kind: str
+    source: str
+    run_id: str
+    started: str
+    finished: str
+    listed: int
+    listed_lines: int
+    archived: int
+    missing: int
+    months_affected: int
+    undated: int
+    not_in_listing: int
+    listing_complete: bool
+    verdict: str
+    reason: str | None
+    reconcile_advanced_to: str | None
+    # Present only on kind == "audit_repair".
+    ranges: list[str] | None = None
+    estimated_bytes: int | None = None
+    budget_bytes: int | None = None
+    decision: str | None = None
+    missing_after: int | None = None
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+
+def build_audit_record(*, source: str, run_id: str, started: datetime,
+                       finished: datetime, listing, report, verdict,
+                       advanced_to: datetime | None = None,
+                       kind: str = "audit", **extra) -> AuditRecord:
+    return AuditRecord(
+        kind=kind,
+        source=source,
+        run_id=run_id,
+        started=started.isoformat(),
+        finished=finished.isoformat(),
+        listed=len(listing.paths),
+        listed_lines=listing.listed_lines,
+        archived=report.archived if report is not None else 0,
+        missing=report.missing_count if report is not None else 0,
+        months_affected=report.months_affected if report is not None else 0,
+        undated=report.undated if report is not None else 0,
+        not_in_listing=report.not_in_listing if report is not None else 0,
+        listing_complete=listing.complete,
+        verdict=verdict.verdict,
+        reason=verdict.reason,
+        reconcile_advanced_to=(advanced_to.isoformat() if advanced_to else None),
+        **extra,
+    )
